@@ -1,0 +1,168 @@
+!pip install skyfield == 1.55
+!pip install astropy
+#installs both libraries
+import skyfield
+print(skyfield.__version__)
+#check version of skyfield
+
+import csv
+import json
+from skyfield.api import EarthSatellite, load
+
+max_days = 7.0    #decides the maximum amoount of days that we can leave the file without reloading it from celestrack
+base = 'https://celestrak.org/NORAD/elements/gp.php'
+group = 'gps-ops'
+
+files = {
+    f'{group}.csv':  base + f'?GROUP={group}&FORMAT=csv',
+    f'{group}.json': base + f'?GROUP={group}&FORMAT=json',
+}
+
+for name, url in files.items():
+    if not load.exists(name) or load.days_old(name) >= max_days:
+        load.download(url, filename=name)
+
+ts = load.timescale()
+
+# Load the JSON file
+with load.open(f'{group}.json') as f:
+    data = json.load(f)
+sats_json = [EarthSatellite.from_omm(ts, fields) for fields in data]
+print('Loaded', len(sats_json), 'satellites from JSON')
+
+# Load the CSV file
+with load.open(f'{group}.csv', mode='r') as f:
+    data = list(csv.DictReader(f))
+sats_csv = [EarthSatellite.from_omm(ts, fields) for fields in data]
+print('Loaded', len(sats_csv), 'satellites from CSV')
+
+from skyfield.api import load, wgs84
+import numpy as np
+
+# ---------------- Setup ----------------
+ts = load.timescale()
+eph = load('de421.bsp')
+earth, sun = eph['earth'], eph['sun']
+telescope = wgs84.latlon(52.376213, -1.563694) #rough position of our latitude and longitude from online
+
+# Frame size in arcminutes (width along azimuth, height along altitude) given by professor
+FOV_W, FOV_H = 32.0, 21.0
+
+START = ts.utc(2026, 11, 12, 21, 0, 0)  # observing session start (UTC)
+LEAD_S = 60.0  # aim time = previous exit (or START) + this many seconds 
+MIN_ALT = 30.0  # in degrees. Say 30 due to the trees
+DARK_SUN_ALT = -6.0  # degrees. used to determine if it is light b sunlight or not (hence visible or not)
+SEARCH_S = 10800.0  # will search again for new visible satelliltes in the next 3 hours
+SEARCH_STEP = 5.0  # seconds between visibility checks
+WINDOW_S = 120.0  # +/- seconds searched around the aim time for frame crossing
+STEP_S = 0.02  # time resolution of the crossing calculation
+MAX_PASSES = 10
+
+# ---------------- Satellite input ----------------
+if 'sats_csv' in locals():
+    satellites = list(sats_csv.values() if isinstance(sats_csv, dict) else sats_csv)
+elif 'sat_csv' in locals():
+    satellites = list(sat_csv.values() if isinstance(sat_csv, dict) else sat_csv)
+else:
+    raise NameError("Define sat_csv or sats_csv first.")   #just checking the previous cell was loaded as that part was in a different cell on pycharm
+
+
+# ---------------- Helpers ----------------
+def offset_time(t, seconds):
+    """t plus seconds (scalar or array)."""
+    return ts.tt_jd(t.tt + np.asarray(seconds) / 86400.0)
+
+
+def fmt(t):
+    return t.utc_datetime().strftime('%H:%M:%S.%f')[:-3]
+
+
+def look(sat, t):
+    alt, az, _ = (sat - telescope).at(t).altaz()  #
+    return alt.degrees, az.degrees
+
+
+def sun_alt(t):
+    alt, _, _ = (earth + telescope).at(t).observe(sun).apparent().altaz()
+    return alt.degrees
+
+
+def next_visible(t_start, used):
+    """Earliest (time, sat) after t_start where a satellite is sunlit, above
+    MIN_ALT, and the sky is dark. Vectorised over time for each satellite."""
+    offs = np.arange(0, SEARCH_S + SEARCH_STEP, SEARCH_STEP)
+    times = offset_time(t_start, offs)
+    dark = sun_alt(times) < DARK_SUN_ALT
+    best = None
+    for sat in satellites:
+        if sat.name in used:
+            continue            
+        alt, _ = look(sat, times)
+        sunlit = np.asarray(sat.at(times).is_sunlit(eph), dtype=bool)
+        ok = dark & sunlit & (alt > MIN_ALT)
+        if ok.any():
+            i = int(np.argmax(ok))  # first True
+            if best is None or i < best[0]:
+                best = (i, sat)
+    if best is None:
+        return None
+    i, sat = best
+    return offset_time(t_start, offs[i]), sat
+
+
+def transit(sat, t_aim):
+    """Entry / centre / exit times for a fixed alt-az frame centred on the
+    satellite's position at t_aim."""
+    n = int(WINDOW_S / STEP_S)
+    offs = np.arange(-n, n + 1) * STEP_S
+    t = offset_time(t_aim, offs)
+    alt, az = look(sat, t)
+    alt0, az0 = look(sat, t_aim)
+
+    d_alt = (alt - alt0) * 60.0
+    d_az = ((az - az0 + 180.0) % 360.0 - 180.0) * np.cos(np.radians(alt0)) * 60.0
+    inside = (np.abs(d_az) <= FOV_W / 2) & (np.abs(d_alt) <= FOV_H / 2)
+
+    lo = hi = n  # index n is t_aim (frame centre)
+    while lo > 0 and inside[lo - 1]:
+        lo -= 1
+    while hi < len(offs) - 1 and inside[hi + 1]:
+        hi += 1
+
+    entry = None if lo == 0 else offset_time(t_aim, offs[lo])
+    exit_ = None if hi == len(offs) - 1 else offset_time(t_aim, offs[hi])
+    return alt0, az0, entry, exit_, offs[lo], offs[hi]
+
+
+# ---------------- Main loop ----------------
+used = set()
+t_ref = offset_time(START, LEAD_S)  # first aim search starts 1 min after START
+
+print(f"Frame: {FOV_W}' x {FOV_H}'   |   session start {fmt(START)} UTC\n")
+
+for n_pass in range(1, MAX_PASSES + 1):    #We could change this such that we can get various measurements of the same satellite (for the triangulation)
+    found = next_visible(t_ref, used)      #perhaps that it sets it to the back of the queue so it cycles through the other satellites giving time for the satellite to move or by stating it must move a certain amount before looking to measure it again
+    if found is None:
+        print(f"No further visible satellites within {SEARCH_S / 60:.0f} min of {fmt(t_ref)} UTC. Stopping.")   
+        break
+
+    t_aim, sat = found
+    used.add(sat.name)
+    alt0, az0, entry, exit_, off_in, off_out = transit(sat, t_aim)
+
+    print(f"=== Target {n_pass}: {sat.name} ===")
+    print(f"  Point telescope at   : Az {az0:.3f}°, Alt {alt0:.3f}°")
+    print(f"  Satellite at that pos: {fmt(t_aim)} UTC (frame centre)")
+    print(f"  Enters frame         : {fmt(entry) + ' UTC' if entry is not None else 'already in frame at window start'}")
+    print(f"  Centre of frame      : {fmt(t_aim)} UTC")
+    print(f"  Leaves frame         : {fmt(exit_) + ' UTC' if exit_ is not None else 'still in frame at window end'}")
+
+    print(f"  Time in frame        : {off_out - off_in:.2f} s")
+    print("-" * 60)
+
+    if exit_ is None:
+        print("Satellite does not leave the frame within the search window "
+              "(very slow mover, e.g. geostationary). Stopping.")  #just checks the satellite isn't in a geostationary orbit
+        break
+
+    t_ref = offset_time(exit_, LEAD_S)  # next target is searched 1 min after exit, giving time for the telescope to have moved
