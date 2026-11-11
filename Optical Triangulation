@@ -152,7 +152,7 @@ def transit(sat, t_aim):
 
     entry = None if lo == 0 else offset_time(t_aim, offs[lo])
     exit_ = None if hi == len(offs) - 1 else offset_time(t_aim, offs[hi])
-    return alt0, az0, entry, exit_, offs[lo], offs[hi]
+    return entry, exit_, offs[lo], offs[hi]
 
 
 # ---------------- Main loop ----------------
