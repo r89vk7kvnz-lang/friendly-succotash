@@ -9,7 +9,7 @@ import csv
 import json
 from skyfield.api import EarthSatellite, load
 
-max_days = 7.0    #decides the maximum amoount of days that we can leave the file without reloading it from celestrack
+max_days = 7.0    #decides the maximum amount of days that we can leave the file without reloading it from celestrack
 base = 'https://celestrak.org/NORAD/elements/gp.php'
 group = 'gps-ops'
 
@@ -45,7 +45,7 @@ eph = load('de421.bsp')
 earth, sun = eph['earth'], eph['sun']
 telescope = wgs84.latlon(52.376213, -1.563694) #rough position of our latitude and longitude from online
 
-# Frame size in arcminutes (width along azimuth, height along altitude) given by professor
+# Frame size in arcminutes (width along RA, height along DEC) given by professor
 FOV_W, FOV_H = 32.0, 21.0
 
 START = ts.utc(2026, 11, 12, 21, 0, 0)  # observing session start (UTC)
@@ -81,6 +81,27 @@ def look(sat, t):
     alt, az, _ = (sat - telescope).at(t).altaz()  #
     return alt.degrees, az.degrees
 
+def radec(sat, t, epoch='date'):
+    """Topocentric RA/Dec in degrees (parallax included).
+    epoch='date' -> JNow, epoch=None -> J2000/ICRS."""
+    ra, dec, _ = (sat - telescope).at(t).radec(epoch)
+    return ra.hours * 15.0, dec.degrees
+ 
+ 
+def hms(hours):
+    h = int(hours)
+    m = int((hours - h) * 60)
+    s = ((hours - h) * 60 - m) * 60
+    return f"{h:02d}h {m:02d}m {s:05.2f}s"
+ 
+ 
+def dms(deg):
+    sign = '-' if deg < 0 else '+'
+    deg = abs(deg)
+    d = int(deg)
+    m = int((deg - d) * 60)
+    s = ((deg - d) * 60 - m) * 60
+    return f"{sign}{d:02d}° {m:02d}' {s:04.1f}\""
 
 def sun_alt(t):
     alt, _, _ = (earth + telescope).at(t).observe(sun).apparent().altaz()
@@ -116,12 +137,12 @@ def transit(sat, t_aim):
     n = int(WINDOW_S / STEP_S)
     offs = np.arange(-n, n + 1) * STEP_S
     t = offset_time(t_aim, offs)
-    alt, az = look(sat, t)
-    alt0, az0 = look(sat, t_aim)
+    ra, dec = radec(sat, t)
+    ra0, dec0 = radec(sat, t_aim)
 
-    d_alt = (alt - alt0) * 60.0
-    d_az = ((az - az0 + 180.0) % 360.0 - 180.0) * np.cos(np.radians(alt0)) * 60.0
-    inside = (np.abs(d_az) <= FOV_W / 2) & (np.abs(d_alt) <= FOV_H / 2)
+    d_dec = (dec - dec0) * 60.0
+    d_ra = ((ra - ra0 + 180.0) % 360.0 - 180.0) * np.cos(np.radians(dec0)) * 60.0
+    inside = (np.abs(d_ra) <= FOV_W / 2) & (np.abs(d_dec) <= FOV_H / 2)
 
     lo = hi = n  # index n is t_aim (frame centre)
     while lo > 0 and inside[lo - 1]:
@@ -146,23 +167,35 @@ for n_pass in range(1, MAX_PASSES + 1):    #We could change this such that we ca
         print(f"No further visible satellites within {SEARCH_S / 60:.0f} min of {fmt(t_ref)} UTC. Stopping.")   
         break
 
+
+
+
     t_aim, sat = found
     used.add(sat.name)
-    alt0, az0, entry, exit_, off_in, off_out = transit(sat, t_aim)
-
+    entry, exit_, off_in, off_out = transit(sat, t_aim)
+ 
+    alt0, az0 = look(sat, t_aim)
+    ra_now, dec_now = radec(sat, t_aim, epoch='date')
+    ra_j2k, dec_j2k = radec(sat, t_aim, epoch=None)
+    lst = (t_aim.gast + telescope.longitude.degrees / 15.0) % 24.0
+    ha = ((lst - ra_now / 15.0 + 12.0) % 24.0) - 12.0  # hours, east negative
+ 
     print(f"=== Target {n_pass}: {sat.name} ===")
-    print(f"  Point telescope at   : Az {az0:.3f}°, Alt {alt0:.3f}°")
-    print(f"  Satellite at that pos: {fmt(t_aim)} UTC (frame centre)")
-    print(f"  Enters frame         : {fmt(entry) + ' UTC' if entry is not None else 'already in frame at window start'}")
-    print(f"  Centre of frame      : {fmt(t_aim)} UTC")
-    print(f"  Leaves frame         : {fmt(exit_) + ' UTC' if exit_ is not None else 'still in frame at window end'}")
-
-    print(f"  Time in frame        : {off_out - off_in:.2f} s")
+    print(f"  Point telescope at (JNow) : RA {hms(ra_now / 15)}, Dec {dms(dec_now)}")
+    print(f"  Point telescope at (J2000): RA {hms(ra_j2k / 15)}, Dec {dms(dec_j2k)}")
+    print(f"  Hour angle at aim time    : {ha:+.3f} h")
+    print(f"  (Alt/Az at aim time       : Alt {alt0:.2f}°, Az {az0:.2f}°)")
+    print(f"  Satellite at that pos     : {fmt(t_aim)} UTC (frame centre)")
+    print(f"  Enters frame              : {fmt(entry) + ' UTC' if entry is not None else 'already in frame at window start'}")
+    print(f"  Centre of frame           : {fmt(t_aim)} UTC")
+    print(f"  Leaves frame              : {fmt(exit_) + ' UTC' if exit_ is not None else 'still in frame at window end'}")
+    print(f"  Time in frame             : {off_out - off_in:.2f} s")
     print("-" * 60)
-
+ 
     if exit_ is None:
         print("Satellite does not leave the frame within the search window "
-              "(very slow mover, e.g. geostationary). Stopping.")  #just checks the satellite isn't in a geostationary orbit
+              "(very slow mover, e.g. geostationary). Stopping.")
         break
+ 
+    t_ref = offset_time(exit_, LEAD_S)  # next target is searched LEAD_S after exit
 
-    t_ref = offset_time(exit_, LEAD_S)  # next target is searched 1 min after exit, giving time for the telescope to have moved
