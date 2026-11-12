@@ -1,21 +1,24 @@
-!pip install skyfield == 1.55
-!pip install astropy
-#installs both libraries
+#%%
+# !pip install skyfield==1.55
+# !pip install astropy matplotlib
+
 import skyfield
-print(skyfield.__version__)
-#check version of skyfield
+
+print(skyfield.__version__)  # check version of skyfield
 
 import csv
 import json
+from datetime import timedelta
 from skyfield.api import EarthSatellite, load
 
-max_days = 7.0    #decides the maximum amount of days that we can leave the file without reloading it from celestrack
+max_days = 7.0  # maximum age (days) of the files before they are re-downloaded from CelesTrak
 base = 'https://celestrak.org/NORAD/elements/gp.php'
 group = 'gps-ops'
 
 files = {
-    f'{group}.csv':  base + f'?GROUP={group}&FORMAT=csv',
+    f'{group}.csv': base + f'?GROUP={group}&FORMAT=csv',
     f'{group}.json': base + f'?GROUP={group}&FORMAT=json',
+    f'{group}.tle': base + f'?GROUP={group}&FORMAT=tle',  # only used to put TLE lines in the plan
 }
 
 for name, url in files.items():
@@ -36,27 +39,42 @@ with load.open(f'{group}.csv', mode='r') as f:
 sats_csv = [EarthSatellite.from_omm(ts, fields) for fields in data]
 print('Loaded', len(sats_csv), 'satellites from CSV')
 
+# The CSV/JSON data has no TLE lines, so read them from the TLE file, keyed by NORAD number
+with load.open(f'{group}.tle', mode='r') as f:
+    tle_text = [ln.rstrip() for ln in f.read().splitlines() if ln.strip()]
+tle_lines = {}  # NORAD catalogue number -> [line 1, line 2]
+for i, ln in enumerate(tle_text[:-1]):
+    if ln.startswith('1 ') and tle_text[i + 1].startswith('2 '):
+        tle_lines[int(ln[2:7])] = [ln, tle_text[i + 1]]
+print('Found TLE lines for', len(tle_lines), 'satellites')
+
 from skyfield.api import load, wgs84
 import numpy as np
+import matplotlib.pyplot as plt
 
-# ---------------- Setup ----------------
 ts = load.timescale()
 eph = load('de421.bsp')
 earth, sun = eph['earth'], eph['sun']
-telescope = wgs84.latlon(52.376213, -1.563694) #rough position of our latitude and longitude from online
+telescope = wgs84.latlon(52.376213, -1.563694)  # rough position of our latitude and longitude from online
 
-# Frame size in arcminutes (width along RA, height along DEC) given by professor
+# Frame size in arcminutes (width along RA, height along Dec) given by professor
 FOV_W, FOV_H = 32.0, 21.0
 
 START = ts.utc(2026, 11, 12, 21, 0, 0)  # observing session start (UTC)
-LEAD_S = 60.0  # aim time = previous exit (or START) + this many seconds 
+LEAD_S = 60.0  # aim time = previous exit (or START) + this many seconds
 MIN_ALT = 30.0  # in degrees. Say 30 due to the trees
-DARK_SUN_ALT = -6.0  # degrees. used to determine if it is light b sunlight or not (hence visible or not)
-SEARCH_S = 10800.0  # will search again for new visible satelliltes in the next 3 hours
+DARK_SUN_ALT = -6.0  # degrees. Sun must be below this for the sky to count as dark
+SEARCH_S = 10800.0  # search the next 3 hours for new visible satellites
 SEARCH_STEP = 5.0  # seconds between visibility checks
 WINDOW_S = 120.0  # +/- seconds searched around the aim time for frame crossing
 STEP_S = 0.02  # time resolution of the crossing calculation
 MAX_PASSES = 10
+
+# Exposure settings written to the plan. 2 s is the value from the wide-field example -
+# CHECK these against your telescope's pipeline.
+CAM_EXPOSURE_S = 2
+
+ORBIT_SPAN_H = 12.0  # length of orbit drawn in the orbit plot (GPS period is ~11.97 h)
 
 # ---------------- Satellite input ----------------
 if 'sats_csv' in locals():
@@ -64,10 +82,9 @@ if 'sats_csv' in locals():
 elif 'sat_csv' in locals():
     satellites = list(sat_csv.values() if isinstance(sat_csv, dict) else sat_csv)
 else:
-    raise NameError("Define sat_csv or sats_csv first.")   #just checking the previous cell was loaded as that part was in a different cell on pycharm
+    raise NameError("Define sat_csv or sats_csv first.")
 
 
-# ---------------- Helpers ----------------
 def offset_time(t, seconds):
     """t plus seconds (scalar or array)."""
     return ts.tt_jd(t.tt + np.asarray(seconds) / 86400.0)
@@ -77,24 +94,35 @@ def fmt(t):
     return t.utc_datetime().strftime('%H:%M:%S.%f')[:-3]
 
 
+def plan_time(t, round_up=False):
+    """Time as 'YYYY-MM-DDTHH:MM:SS' (whole seconds, like the wide-field plan).
+    Start times are rounded down and end times up, so the window is never shortened."""
+    dt = t.utc_datetime().replace(tzinfo=None)
+    whole = dt.replace(microsecond=0)
+    if round_up and dt.microsecond:
+        whole += timedelta(seconds=1)
+    return whole.strftime('%Y-%m-%dT%H:%M:%S')
+
+
 def look(sat, t):
-    alt, az, _ = (sat - telescope).at(t).altaz()  #
+    alt, az, _ = (sat - telescope).at(t).altaz()
     return alt.degrees, az.degrees
+
 
 def radec(sat, t, epoch='date'):
     """Topocentric RA/Dec in degrees (parallax included).
     epoch='date' -> JNow, epoch=None -> J2000/ICRS."""
     ra, dec, _ = (sat - telescope).at(t).radec(epoch)
     return ra.hours * 15.0, dec.degrees
- 
- 
+
+
 def hms(hours):
     h = int(hours)
     m = int((hours - h) * 60)
     s = ((hours - h) * 60 - m) * 60
     return f"{h:02d}h {m:02d}m {s:05.2f}s"
- 
- 
+
+
 def dms(deg):
     sign = '-' if deg < 0 else '+'
     deg = abs(deg)
@@ -102,6 +130,7 @@ def dms(deg):
     m = int((deg - d) * 60)
     s = ((deg - d) * 60 - m) * 60
     return f"{sign}{d:02d}° {m:02d}' {s:04.1f}\""
+
 
 def sun_alt(t):
     alt, _, _ = (earth + telescope).at(t).observe(sun).apparent().altaz()
@@ -117,7 +146,7 @@ def next_visible(t_start, used):
     best = None
     for sat in satellites:
         if sat.name in used:
-            continue            
+            continue
         alt, _ = look(sat, times)
         sunlit = np.asarray(sat.at(times).is_sunlit(eph), dtype=bool)
         ok = dark & sunlit & (alt > MIN_ALT)
@@ -132,8 +161,9 @@ def next_visible(t_start, used):
 
 
 def transit(sat, t_aim):
-    """Entry / centre / exit times for a fixed alt-az frame centred on the
-    satellite's position at t_aim."""
+    """Entry / exit times for a frame fixed in RA/Dec (sidereal tracking), centred on
+    the satellite's topocentric position at t_aim. Returns four values:
+    entry, exit_, offset_in_s, offset_out_s."""
     n = int(WINDOW_S / STEP_S)
     offs = np.arange(-n, n + 1) * STEP_S
     t = offset_time(t_aim, offs)
@@ -155,47 +185,120 @@ def transit(sat, t_aim):
     return entry, exit_, offs[lo], offs[hi]
 
 
-# ---------------- Main loop ----------------
+passes = []  # one record per target; the plan and the orbit plot are built from these
 used = set()
-t_ref = offset_time(START, LEAD_S)  # first aim search starts 1 min after START
+t_ref = offset_time(START, LEAD_S)  # first aim search starts LEAD_S after START
 
 print(f"Frame: {FOV_W}' x {FOV_H}'   |   session start {fmt(START)} UTC\n")
 
-for n_pass in range(1, MAX_PASSES + 1):    #We could change this such that we can get various measurements of the same satellite (for the triangulation)
-    found = next_visible(t_ref, used)      #perhaps that it sets it to the back of the queue so it cycles through the other satellites giving time for the satellite to move or by stating it must move a certain amount before looking to measure it again
+for n_pass in range(1, MAX_PASSES + 1):
+    found = next_visible(t_ref, used)
     if found is None:
-        print(f"No further visible satellites within {SEARCH_S / 60:.0f} min of {fmt(t_ref)} UTC. Stopping.")   
+        print(f"No further visible satellites within {SEARCH_S / 60:.0f} min of {fmt(t_ref)} UTC. Stopping.")
         break
-
-
-
 
     t_aim, sat = found
     used.add(sat.name)
     entry, exit_, off_in, off_out = transit(sat, t_aim)
- 
+
     alt0, az0 = look(sat, t_aim)
     ra_now, dec_now = radec(sat, t_aim, epoch='date')
     ra_j2k, dec_j2k = radec(sat, t_aim, epoch=None)
     lst = (t_aim.gast + telescope.longitude.degrees / 15.0) % 24.0
     ha = ((lst - ra_now / 15.0 + 12.0) % 24.0) - 12.0  # hours, east negative
- 
+
     print(f"=== Target {n_pass}: {sat.name} ===")
     print(f"  Point telescope at (JNow) : RA {hms(ra_now / 15)}, Dec {dms(dec_now)}")
     print(f"  Point telescope at (J2000): RA {hms(ra_j2k / 15)}, Dec {dms(dec_j2k)}")
     print(f"  Hour angle at aim time    : {ha:+.3f} h")
     print(f"  (Alt/Az at aim time       : Alt {alt0:.2f}°, Az {az0:.2f}°)")
     print(f"  Satellite at that pos     : {fmt(t_aim)} UTC (frame centre)")
-    print(f"  Enters frame              : {fmt(entry) + ' UTC' if entry is not None else 'already in frame at window start'}")
+    print(
+        f"  Enters frame              : {fmt(entry) + ' UTC' if entry is not None else 'already in frame at window start'}")
     print(f"  Centre of frame           : {fmt(t_aim)} UTC")
-    print(f"  Leaves frame              : {fmt(exit_) + ' UTC' if exit_ is not None else 'still in frame at window end'}")
+    print(
+        f"  Leaves frame              : {fmt(exit_) + ' UTC' if exit_ is not None else 'still in frame at window end'}")
     print(f"  Time in frame             : {off_out - off_in:.2f} s")
     print("-" * 60)
- 
+
+    # Entry / exit as times even if the satellite is still in the frame at the window edge
+    t_in = offset_time(t_aim, off_in)
+    t_out = offset_time(t_aim, off_out)
+
+    passes.append(dict(
+        n=n_pass, sat=sat, t_aim=t_aim, t_in=t_in, t_out=t_out,
+        ra_j2k=float(ra_j2k), dec_j2k=float(dec_j2k),
+    ))
+
     if exit_ is None:
         print("Satellite does not leave the frame within the search window "
               "(very slow mover, e.g. geostationary). Stopping.")
         break
- 
+
     t_ref = offset_time(exit_, LEAD_S)  # next target is searched LEAD_S after exit
+
+
+def build_plan(passes):
+    """One 'ObserveTLESidereal' action per target, in the same layout as the wide-field
+    plan. Each action has a single field: the frame centred on the satellite's position
+    at the centre time, held fixed on the sky (sidereal tracking). The action window
+    runs from the moment the satellite enters the frame to the moment it leaves.
+    Field = [RA at entry, RA at exit, RA of frame centre, Dec of frame centre], in
+    degrees, J2000 (the same epoch the wide-field code used)."""
+    plan = {
+        "night": START.utc_datetime().strftime('%Y-%m-%d'),
+        "dome": {
+            "open": "auto",
+            "close": "auto"
+        },
+        "actions": []
+    }
+
+    for p in passes:
+        sat = p['sat']
+        norad = int(sat.model.satnum)
+
+        tle = tle_lines.get(norad)
+        if tle is None:
+            print(f"WARNING: no TLE lines found for {sat.name} (NORAD {norad}); 'tle' left empty")
+
+        ra_in, _ = radec(sat, p['t_in'], epoch=None)
+        ra_out, _ = radec(sat, p['t_out'], epoch=None)
+
+        field = [float(ra_in), float(ra_out), p['ra_j2k'], p['dec_j2k']]
+
+        plan["actions"].append({
+            "type": "ObserveTimeSeries",
+            "tle": tle,
+            "start": plan_time(p['t_in']),
+            "end": plan_time(p['t_out'], round_up=True),
+            "ra": p['ra_j2k'],
+            "dec": p['dec_j2k'],
+
+
+
+            "camera":{
+                "exposure": 2,
+            },
+
+            "pipeline":{
+
+                "prefix": str(norad),
+                "object": sat.name
+            }})
+
+
+
+
+        print(sat.name, "- 1 field:", f"RA {field[2]:.4f}, Dec {field[3]:.4f}",
+              f"| {plan_time(p['t_in'])} to {plan_time(p['t_out'], round_up=True)} UTC")
+
+    return plan
+
+
+plan = build_plan(passes)
+
+with open("observation_plan.json", "w") as file:
+    json.dump(plan, file, indent=4)
+print("Observation plan saved to observation_plan.json")
 
