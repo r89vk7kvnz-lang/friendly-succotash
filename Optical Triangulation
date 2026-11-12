@@ -269,7 +269,6 @@ def build_plan(passes):
 
         plan["actions"].append({
             "type": "ObserveTimeSeries",
-            "tle": tle,
             "start": plan_time(p['t_in']),
             "end": plan_time(p['t_out'], round_up=True),
             "ra": p['ra_j2k'],
