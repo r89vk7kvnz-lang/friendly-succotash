@@ -1,0 +1,200 @@
+#%%
+import os
+import json
+import warnings
+from pathlib import Path
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.ndimage import shift
+from astropy.io import fits
+from astropy.wcs import WCS, FITSFixedWarning
+from astropy.time import Time
+from astropy.coordinates import SkyCoord
+import astropy.units as u
+from skyfield.api import EarthSatellite, load, wgs84
+
+warnings.filterwarnings("ignore", category=FITSFixedWarning)
+warnings.filterwarnings("ignore", message=".*non-standard WCS keywords.*")
+
+# --- 1. CONFIGURATION ---
+folder_path = Path("/Users/joseph/Downloads/29486")
+search_radius_arcmin = 25.0
+max_pointing_drift_arcmin = 5.0
+max_time_gap_sec = 300.0
+
+# --- 2. FETCH CELESTRAK GPS-OPS USING OMM JSON ---
+max_days = 7.0
+base = "https://celestrak.org"
+group = "gps-ops"
+json_filename = f"{group}.json"
+json_url = f"{base}?GROUP={group}&FORMAT=json"
+
+if not load.exists(json_filename) or load.days_old(json_filename) >= max_days:
+    load.download(json_url, filename=json_filename)
+
+ts = load.timescale()
+with load.open(json_filename) as f:
+    data = json.load(f)
+
+gps_satellites = [EarthSatellite.from_omm(ts, fields) for fields in data]
+print(f"Loaded {len(gps_satellites)} GPS satellites from JSON")
+
+def get_observer_from_header(header):
+    lat = float(header.get("GPS-LAT", 52.376868))
+    lon = float(header.get("GPS-LON", -1.567202))
+    elev = float(header.get("SITEELEV", 94.0))
+    return wgs84.latlon(lat, lon, elevation_m=elev)
+
+def get_sat_radec(sat, observer, astropy_time):
+    t_sf = ts.from_astropy(astropy_time)
+    topocentric = (sat - observer).at(t_sf)
+    ra, dec, _ = topocentric.radec()
+    return ra._degrees, dec.degrees
+
+# --- 3. SCAN FILES & GROUP INTO PASSES ---
+all_files = [str(p) for p in folder_path.glob("*.fit*") if p.is_file() and not p.name.startswith("stacked_")]
+print(f"Scanning {len(all_files)} FITS files...")
+
+metadata_list = []
+for fp in all_files:
+    with fits.open(fp) as hdul:
+        hdu = next(h for h in hdul if h.data is not None)
+        hdr = hdu.header
+        h, w = hdu.data.shape
+        wcs = WCS(hdr)
+        t_obs = Time(hdr["DATE-OBS"], format="isot", scale="utc")
+        ra_c, dec_c = wcs.pixel_to_world_values(w / 2.0, h / 2.0)
+        coord = SkyCoord(ra=ra_c * u.deg, dec=dec_c * u.deg)
+        metadata_list.append({"path": fp, "time": t_obs, "coord": coord})
+
+metadata_list.sort(key=lambda x: x["time"])
+
+passes = []
+current_pass = []
+for item in metadata_list:
+    if not current_pass:
+        current_pass.append(item)
+        continue
+    prev = current_pass[-1]
+    sep_arcmin = prev["coord"].separation(item["coord"]).arcminute
+    dt_sec = (item["time"] - prev["time"]).sec
+    if sep_arcmin <= max_pointing_drift_arcmin and dt_sec <= max_time_gap_sec:
+        current_pass.append(item)
+    else:
+        passes.append(current_pass)
+        current_pass = [item]
+if current_pass:
+    passes.append(current_pass)
+
+print(f"Found {len(passes)} distinct telescope passes.\n")
+
+# --- 4. IDENTIFY & SHIFT-STACK EACH PASS ---
+saved_outputs = []
+
+for pass_idx, pass_items in enumerate(passes, 1):
+    print(f"=== PASS {pass_idx}/{len(passes)} ({len(pass_items)} frames) ===")
+    if len(pass_items) < 2:
+        continue
+
+    mid_item = pass_items[len(pass_items) // 2]
+    with fits.open(mid_item["path"]) as hdul:
+        mid_hdr = next(h for h in hdul if h.data is not None).header
+        observer = get_observer_from_header(mid_hdr)
+        exptime = float(mid_hdr.get("EXPTIME", 0.5))
+
+    # Midpoint timestamp = DATE-OBS + 0.5*EXPTIME + 0.125s shutter delay
+    t_mid = mid_item["time"] + (0.5 * exptime + 0.125) * u.s
+    t_mid_sf = ts.from_astropy(t_mid)
+    center_coord = mid_item["coord"]
+
+    candidates = []
+    for sat in gps_satellites:
+        ra, dec, dist = (sat - observer).at(t_mid_sf).radec()
+        sat_coord = SkyCoord(ra=ra._degrees * u.deg, dec=dec.degrees * u.deg)
+        sep_arcmin = center_coord.separation(sat_coord).arcminute
+        if sep_arcmin <= search_radius_arcmin:
+            candidates.append((sep_arcmin, sat, dist.km))
+
+    candidates.sort(key=lambda x: x)
+    if not candidates:
+        print("No GPS satellite matched. Skipping.\n")
+        continue
+
+    best_sep, best_sat, _ = next(iter(candidates))
+    print(f"Matched: {best_sat.name} (NORAD {best_sat.model.satnum}) | Midpoint Offset: {best_sep:.2f}'")
+
+    shifted_frames = []
+    ref_header = None
+
+    for item in pass_items:
+        with fits.open(item["path"]) as hdul:
+            hdu = next(h for h in hdul if h.data is not None)
+            data = hdu.data.astype(float)
+            hdr = hdu.header
+            h, w = data.shape
+            wcs = WCS(hdr)
+            observer = get_observer_from_header(hdr)
+
+            t_start = Time(hdr["DATE-OBS"], format="isot", scale="utc")
+            exptime = float(hdr.get("EXPTIME", 0.5))
+            rowdelta_us = float(hdr.get("ROWDELTA", 39.027))
+            binning = int(hdr.get("CAM-BIN", 3))
+            row_period_sec = (rowdelta_us * binning) * 1e-6
+
+            # Pass 1: Estimate Y pixel using mid-exposure time of row 0
+            t_est = t_start + (0.5 * exptime) * u.s
+            ra_est, dec_est = get_sat_radec(best_sat, observer, t_est)
+            _, px_y_est = wcs.world_to_pixel_values(ra_est, dec_est)
+
+            # Pass 2: Exact mid-exposure time for row px_y_est (y=0 is bottom/row 0)
+            row_delay_sec = np.clip(px_y_est, 0, h) * row_period_sec
+            t_exact = t_start + (0.5 * exptime + row_delay_sec) * u.s
+            ra_exact, dec_exact = get_sat_radec(best_sat, observer, t_exact)
+
+            # Exact pixel location in THIS frame using full TAN-SIP WCS
+            px_x, px_y = wcs.world_to_pixel_values(ra_exact, dec_exact)
+
+            # Subtract median background of active image region so sky variations don't wash out signal
+            data_sub = data - np.nanmedian(data[10:2120, 20:3190])
+
+            # Shift frame so (px_x, px_y) lands dead-center at (w/2, h/2)
+            dy = (h / 2.0) - px_y
+            dx = (w / 2.0) - px_x
+            shifted_img = shift(data_sub, shift=(dy, dx), order=1, mode="constant", cval=np.nan)
+            shifted_frames.append(shifted_img)
+
+            if ref_header is None:
+                ref_header = hdr.copy()
+
+    stacked_image = np.nanmedian(np.array(shifted_frames), axis=0)
+    clean_name = best_sat.name.replace(" ", "_").replace("(", "").replace(")", "")
+    timestamp_tag = next(iter(pass_items))["time"].strftime("%Y%m%d_%H%M%S")
+    out_file = folder_path / f"stacked_{clean_name}_pass{pass_idx}_{timestamp_tag}.fits"
+
+    fits.writeto(out_file, stacked_image, ref_header, overwrite=True)
+    saved_outputs.append(out_file)
+    print(f"Saved -> {out_file.name}\n")
+
+# --- 5. ZOOMED-IN 100x100 PLOT AROUND CENTER ---
+if saved_outputs:
+    zoom_radius = 50
+    fig, axes = plt.subplots(1, len(saved_outputs), figsize=(5 * len(saved_outputs), 5))
+    if len(saved_outputs) == 1:
+        axes = [axes]
+
+    for ax, fpath in zip(axes, saved_outputs):
+        img = fits.getdata(fpath)
+        img_h, img_w = img.shape
+        cx, cy = img_w // 2, img_h // 2
+        crop = img[cy - zoom_radius:cy + zoom_radius, cx - zoom_radius:cx + zoom_radius]
+
+        # Robust sigma-clipped stretch around median background
+        med = np.nanmedian(crop)
+        std = np.nanstd(crop)
+        ax.imshow(crop, cmap="gray", origin="lower", vmin=med - 2 * std, vmax=med + 8 * std)
+        ax.set_title(f"{fpath.name}\n(100x100 px centre zoom)", fontsize=9)
+        ax.axhline(zoom_radius, color="cyan", ls="--", lw=0.8, alpha=0.8)
+        ax.axvline(zoom_radius, color="cyan", ls="--", lw=0.8, alpha=0.8)
+
+    plt.tight_layout()
+    plt.show()
